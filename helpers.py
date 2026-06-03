@@ -154,3 +154,73 @@ def sanitize_subj_field(value: str, field_name: str) -> str:
             f"(/, \\, NUL, or newline)."
         )
     return value
+
+
+def ensure_openssl_ca_dir(openssl_cnf_path: str, ca_dir: str) -> None:
+    """
+    Ensures the [ CA_default ] dir value in openssl.cnf points to the active CA directory.
+    This prevents failures when a generated setup folder is moved to a new location.
+    """
+    if not os.path.exists(openssl_cnf_path):
+        logging.warning(f"OpenSSL config file not found: {openssl_cnf_path}")
+        return
+
+    expected_dir = ca_dir.replace("\\", "/")
+    try:
+        with open(openssl_cnf_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception as e:
+        logging.warning(f"Unable to read OpenSSL config {openssl_cnf_path}: {e}")
+        return
+
+    section_start = None
+    section_end = len(lines)
+    for i, line in enumerate(lines):
+        stripped = line.strip().lower()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if stripped in ("[ca_default]", "[ ca_default ]"):
+                section_start = i
+                continue
+            if section_start is not None and i > section_start:
+                section_end = i
+                break
+
+    if section_start is None:
+        logging.warning(f"[ CA_default ] section not found in {openssl_cnf_path}")
+        return
+
+    changed = False
+    dir_line_index = None
+    for i in range(section_start + 1, section_end):
+        if re.match(r"^\s*dir\s*=", lines[i], flags=re.IGNORECASE):
+            dir_line_index = i
+            break
+
+    if dir_line_index is None:
+        insert_index = section_start + 1
+        lines.insert(insert_index, f"dir               = {expected_dir}\n")
+        changed = True
+    else:
+        current_line = lines[dir_line_index]
+        newline = "\n" if current_line.endswith("\n") else ""
+        updated_line = re.sub(
+            r"^(\s*dir\s*=\s*).*$",
+            rf"\1{expected_dir}",
+            current_line.rstrip("\r\n"),
+            flags=re.IGNORECASE,
+        ) + newline
+        if updated_line != current_line:
+            lines[dir_line_index] = updated_line
+            changed = True
+
+    if not changed:
+        return
+
+    try:
+        with open(openssl_cnf_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+        logging.info(
+            f"Updated OpenSSL CA dir in {openssl_cnf_path} to {expected_dir}"
+        )
+    except Exception as e:
+        logging.warning(f"Unable to update OpenSSL config {openssl_cnf_path}: {e}")

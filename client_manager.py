@@ -10,7 +10,13 @@
 import os
 import logging
 import shutil
-from helpers import run_command, get_base_dir, create_directory, sanitize_subj_field
+from helpers import (
+    run_command,
+    get_base_dir,
+    create_directory,
+    sanitize_subj_field,
+    ensure_openssl_ca_dir,
+)
 from config import OPENSSL_PATH
 from openvpn_config import (
     update_timestamp,
@@ -45,6 +51,9 @@ def manage_client_creation(
     data_ciphers,
     client_subnet_input=None,
     prompt_for_subnet=True,
+    mtu_fix_enabled=False,
+    mssfix_value=None,
+    tun_mtu_value=None,
 ):
     """
     Manages the creation of client certificates and configurations.
@@ -52,6 +61,9 @@ def manage_client_creation(
     try:
         client_folder = os.path.join(CLIENTS_DIR, client_name)
         os.makedirs(client_folder, exist_ok=True)
+
+        # Repair stale absolute CA paths in openssl.cnf after folder moves.
+        ensure_openssl_ca_dir(openssl_cnf_path, ca_dir)
 
         # Generate client key
         client_key_path = os.path.join(client_folder, f"{client_name}.key")
@@ -237,6 +249,9 @@ def manage_client_creation(
             data_ciphers,
             server_lan_subnet,
             ccd_dir,
+            mtu_fix_enabled=mtu_fix_enabled,
+            mssfix_value=mssfix_value,
+            tun_mtu_value=tun_mtu_value,
         )
         logging.info(
             f"Server configuration regenerated with updated CRL and client subnets after adding client {client_name}."

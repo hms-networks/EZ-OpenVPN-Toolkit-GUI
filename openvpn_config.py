@@ -32,6 +32,9 @@ def generate_server_conf(
     data_ciphers,
     server_lan_subnet,
     ccd_dir,
+    mtu_fix_enabled=False,
+    mssfix_value=None,
+    tun_mtu_value=None,
 ):
     """
     Generates the OpenVPN server configuration file with certificates and keys inline,
@@ -66,6 +69,13 @@ key-direction 0
 management 0.0.0.0 7505
 """
             )  # Removed leading and trailing newlines
+
+            if mtu_fix_enabled:
+                if mssfix_value is not None:
+                    f.write(f"mssfix {mssfix_value}\n")
+                if tun_mtu_value is not None:
+                    f.write(f"tun-mtu {tun_mtu_value}\n")
+                f.write("\n")
 
             # Inline certificates and keys
             f.write("### Certificates and Keys in Inline Format ###\n")
@@ -267,6 +277,9 @@ def regenerate_server_conf(
     data_ciphers,
     server_lan_subnet,
     ccd_dir,
+    mtu_fix_enabled=False,
+    mssfix_value=None,
+    tun_mtu_value=None,
 ):
     """Regenerates the server configuration to re-inline the updated CRL."""
     generate_server_conf(
@@ -284,5 +297,8 @@ def regenerate_server_conf(
         data_ciphers,
         server_lan_subnet,
         ccd_dir="ccd",  # Pass the relative path as a string
+        mtu_fix_enabled=mtu_fix_enabled,
+        mssfix_value=mssfix_value,
+        tun_mtu_value=tun_mtu_value,
     )
     logging.info(f"Server configuration regenerated at {server_conf_path}")

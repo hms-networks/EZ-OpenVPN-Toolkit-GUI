@@ -10,7 +10,7 @@
 import os
 import logging
 import shutil
-from helpers import run_command, get_base_dir
+from helpers import run_command, get_base_dir, ensure_openssl_ca_dir
 from config import OPENSSL_PATH
 from openvpn_config import regenerate_server_conf
 from subnet_management import remove_client_from_csv, get_subnet_by_name
@@ -28,6 +28,9 @@ def revoke_client(client_name, ca_dir, openssl_cnf_path, subnets_csv):
             logging.error(f"Client certificate not found for {client_name}")
             print(f"Client certificate not found for {client_name}")
             return
+
+        # Repair stale absolute CA paths in openssl.cnf after folder moves.
+        ensure_openssl_ca_dir(openssl_cnf_path, ca_dir)
 
         # Revoke the client certificate
         run_command(
@@ -110,6 +113,9 @@ def revoke_client(client_name, ca_dir, openssl_cnf_path, subnets_csv):
         proto = server_details["proto"]
         cipher = server_details["cipher"]
         data_ciphers = server_details["data_ciphers"]
+        mtu_fix_enabled = bool(server_details.get("mtu_fix_enabled", False))
+        mssfix_value = server_details.get("mssfix")
+        tun_mtu_value = server_details.get("tun_mtu")
 
         # Load openvpn_tunnel_subnet and server_lan_subnet from subnets.csv
         openvpn_tunnel_subnet = get_subnet_by_name(subnets_csv, "openvpn_tunnel_subnet")
@@ -138,6 +144,9 @@ def revoke_client(client_name, ca_dir, openssl_cnf_path, subnets_csv):
             data_ciphers,
             server_lan_subnet,
             ccd_dir="ccd",  # Pass the relative path as a string
+            mtu_fix_enabled=mtu_fix_enabled,
+            mssfix_value=mssfix_value,
+            tun_mtu_value=tun_mtu_value,
         )
         logging.info("Server configuration regenerated after client revocation.")
 

@@ -190,7 +190,7 @@ def _certificate_details(payload: dict) -> dict:
     return details
 
 
-def _server_details(payload: dict) -> tuple[str, str, str, str, list[str]]:
+def _server_details(payload: dict) -> tuple[str, str, str, str, list[str], bool, int | None, int | None]:
     server_address = str(payload.get("server_address", "")).strip()
     port = str(payload.get("port", "")).strip()
     proto = str(payload.get("proto", "udp")).strip().lower()
@@ -205,7 +205,27 @@ def _server_details(payload: dict) -> tuple[str, str, str, str, list[str]]:
     if not data_ciphers:
         raise ValueError("Select at least one data cipher.")
     cipher = min(data_ciphers, key=lambda item: CIPHER_OPTIONS.index(item))
-    return server_address, port, proto, cipher, data_ciphers
+    mtu_fix_enabled = bool(payload.get("mtu_fix_enabled", False))
+    mssfix_raw = payload.get("mssfix")
+    tun_mtu_raw = payload.get("tun_mtu")
+
+    mssfix = None
+    tun_mtu = None
+    if mtu_fix_enabled:
+      if mssfix_raw in (None, "") or tun_mtu_raw in (None, ""):
+        raise ValueError("MTU/MSS fix enabled: both mssfix and tun-mtu are required.")
+      if not str(mssfix_raw).strip().isdigit() or not str(tun_mtu_raw).strip().isdigit():
+        raise ValueError("mssfix and tun-mtu must be positive integer values.")
+
+      mssfix = int(str(mssfix_raw).strip())
+      tun_mtu = int(str(tun_mtu_raw).strip())
+
+      if not (900 <= mssfix <= 1460):
+        raise ValueError("mssfix must be between 900 and 1460.")
+      if not (1200 <= tun_mtu <= 2000):
+        raise ValueError("tun-mtu must be between 1200 and 2000.")
+
+    return server_address, port, proto, cipher, data_ciphers, mtu_fix_enabled, mssfix, tun_mtu
 
 
 def _client_requests(payload: dict, existing_names: set[str]) -> list[dict]:
@@ -226,13 +246,25 @@ def _client_requests(payload: dict, existing_names: set[str]) -> list[dict]:
     return cleaned
 
 
-def _write_server_details(server_address, port, proto, cipher, data_ciphers) -> None:
+def _write_server_details(
+  server_address,
+  port,
+  proto,
+  cipher,
+  data_ciphers,
+  mtu_fix_enabled=False,
+  mssfix=None,
+  tun_mtu=None,
+) -> None:
     details = {
         "server_address": server_address,
         "port": port,
         "proto": proto,
         "cipher": cipher,
         "data_ciphers": data_ciphers,
+    "mtu_fix_enabled": bool(mtu_fix_enabled),
+    "mssfix": mssfix,
+    "tun_mtu": tun_mtu,
     }
     with open(os.path.join(BASE_DIR, "server_details.json"), "w", encoding="utf-8") as f:
         json.dump(details, f)
@@ -244,7 +276,16 @@ def initialize_from_payload(payload: dict) -> dict:
         raise ValueError("Server is already initialized.")
 
     certificate_details = _certificate_details(payload)
-    server_address, port, proto, cipher, data_ciphers = _server_details(payload)
+    (
+      server_address,
+      port,
+      proto,
+      cipher,
+      data_ciphers,
+      mtu_fix_enabled,
+      mssfix,
+      tun_mtu,
+    ) = _server_details(payload)
     clients = _client_requests(payload, set())
 
     existing_subnets = load_existing_subnets(SUBNETS_CSV)
@@ -278,7 +319,16 @@ def initialize_from_payload(payload: dict) -> dict:
 
     openssl_cnf_path = os.path.join(ca_dir, "openssl.cnf")
     generate_server_certificates(ca_dir, server_dir, common_details, openssl_cnf_path)
-    _write_server_details(server_address, port, proto, cipher, list(data_ciphers))
+    _write_server_details(
+      server_address,
+      port,
+      proto,
+      cipher,
+      list(data_ciphers),
+      mtu_fix_enabled=mtu_fix_enabled,
+      mssfix=mssfix,
+      tun_mtu=tun_mtu,
+    )
 
     generate_server_conf(
         os.path.join(server_dir, "server.conf"),
@@ -295,9 +345,15 @@ def initialize_from_payload(payload: dict) -> dict:
         data_ciphers=list(data_ciphers),
         server_lan_subnet=server_lan_subnet,
         ccd_dir="ccd",
+        mtu_fix_enabled=mtu_fix_enabled,
+        mssfix_value=mssfix,
+        tun_mtu_value=tun_mtu,
     )
 
     created = []
+    mtu_fix_enabled = bool(server_details.get("mtu_fix_enabled", False))
+    mssfix_value = server_details.get("mssfix")
+    tun_mtu_value = server_details.get("tun_mtu")
     for client in clients:
         manage_client_creation(
             client["name"],
@@ -435,6 +491,9 @@ def add_clients_from_payload(payload: dict) -> dict:
             list(server_details["data_ciphers"]),
             client_subnet_input=client["subnet"],
             prompt_for_subnet=False,
+            mtu_fix_enabled=mtu_fix_enabled,
+            mssfix_value=mssfix_value,
+            tun_mtu_value=tun_mtu_value,
         )
         created.append(client["name"])
 
@@ -1606,6 +1665,30 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 500;
     }
     .check input { width: auto; min-height: auto; }
+    .mtu-toggle-row {
+      display: flex;
+      justify-content: center;
+      margin-top: 10px;
+    }
+    .mtu-toggle-label {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      margin: 0;
+      font-weight: 600;
+      text-align: center;
+    }
+    .mtu-toggle-label input[type="checkbox"] {
+      width: 18px;
+      height: 18px;
+      min-height: 18px;
+      padding: 0;
+      margin: 0;
+      accent-color: var(--accent);
+      border-radius: 4px;
+      flex: 0 0 auto;
+    }
     .status-note {
       font-weight: 600;
     }
@@ -1781,7 +1864,7 @@ INDEX_HTML = r"""<!doctype html>
           <div id="nameErrorAddClients" style="display:none;margin-top:8px;padding:8px 12px;border-radius:6px;background:#fdecea;color:#a73535;font-weight:600;"></div>
           <div id="subnetErrorAddClients" style="display:none;margin-top:8px;padding:8px 12px;border-radius:6px;background:#fdecea;color:#a73535;font-weight:600;"></div>
           <div class="actions">
-            <button onclick="addClients()">Generate Client</button>
+            <button id="generateClientBtn" onclick="addClients()">Generate Client</button>
           </div>
         </div>
         <div>
@@ -1919,6 +2002,30 @@ INDEX_HTML = r"""<!doctype html>
           <div id="tunnelSubnetError" style="margin-top:4px;margin-bottom:4px;padding:8px 12px;border-radius:6px;background:#fdecea;color:#a73535;font-weight:600;display:none;"></div>
           <label>Server LAN Subnet <input id="lanSubnet" value="192.168.1.0/24" oninput="validateSubnets()"></label>
           <div id="subnetErrorServer" style="display:none;margin-top:8px;padding:8px 12px;border-radius:6px;background:#fdecea;color:#a73535;font-weight:600;"></div>
+          <div style="margin-top:10px;padding:10px;border:1px solid var(--border);border-radius:8px;">
+            <div class="mtu-toggle-row">
+              <label class="mtu-toggle-label">
+                <input id="enableMtuFix" type="checkbox" onchange="toggleMtuFixFields(); validateMtuSettings(); checkInitializeReady()">
+                Enable MTU/MSS compatibility mode
+              </label>
+            </div>
+            <div id="mtuPresetRow" class="row" style="margin-top:8px;display:none;">
+              <label>Preset
+                <select id="mtuPreset" onchange="applyMtuPreset(this.value); validateMtuSettings(); checkInitializeReady()">
+                  <option value="default">Default (1360 / 1428)</option>
+                  <option value="lte">LTE/Cellular (1320 / 1400)</option>
+                  <option value="pppoe">PPPoE (1360 / 1412)</option>
+                  <option value="conservative">Conservative (1240 / 1300)</option>
+                  <option value="manual">Manual</option>
+                </select>
+              </label>
+            </div>
+            <div id="mtuFixFields" class="row" style="margin-top:8px;display:none;">
+              <label>mssfix <input id="mssfixValue" value="1360" inputmode="numeric" pattern="[0-9]*" oninput="setMtuPresetManual(); validateMtuSettings(); checkInitializeReady()"></label>
+              <label>tun-mtu <input id="tunMtuValue" value="1428" inputmode="numeric" pattern="[0-9]*" oninput="setMtuPresetManual(); validateMtuSettings(); checkInitializeReady()"></label>
+            </div>
+            <div id="mtuErrorServer" style="display:none;margin-top:8px;padding:8px 12px;border-radius:6px;background:#fdecea;color:#a73535;font-weight:600;"></div>
+          </div>
           <h3>Data Ciphers</h3>
           <div class="checkboxes" id="cipherChecks"></div>
           <div id="cipherError" style="display:none;margin-top:8px;padding:8px 12px;border-radius:6px;background:#fdecea;color:#a73535;font-weight:600;">At least one data cipher must be selected.</div>
@@ -2084,7 +2191,7 @@ INDEX_HTML = r"""<!doctype html>
       },
       openvpn_server: {
         title: "OpenVPN Server",
-        html: `<p>Configure server address, port, protocol, VPN tunnel subnet, and optional LAN subnet for routing.</p><p>At least one data cipher is required, and subnet entries are validated before initialization starts.</p>`,
+        html: `<p>Configure server address, port, protocol, VPN tunnel subnet, and optional LAN subnet for routing.</p><p>At least one data cipher is required, and subnet entries are validated before initialization starts.</p><p>Advanced MTU/MSS settings are optional and can be enabled for links that need smaller packet sizes.</p>`,
       },
       initial_clients: {
         title: "Initial Clients",
@@ -2208,6 +2315,8 @@ INDEX_HTML = r"""<!doctype html>
       initOverlay.classList.add("show");
       initOverlay.setAttribute("aria-hidden", "false");
       initDoneCloseBtn.style.display = "none";
+      toggleMtuFixFields();
+      validateMtuSettings();
       validateSubnets();
       checkInitializeReady();
     }
@@ -2378,6 +2487,13 @@ INDEX_HTML = r"""<!doctype html>
         generateLabel: "Generate Anybus Defender Deployment Package",
       },
     ];
+
+    const MTU_PRESETS = {
+      default: { mssfix: 1360, tunMtu: 1428 },
+      lte: { mssfix: 1320, tunMtu: 1400 },
+      pppoe: { mssfix: 1360, tunMtu: 1412 },
+      conservative: { mssfix: 1240, tunMtu: 1300 },
+    };
 
     // --- Subnet overlap validation (mirrors subnet_management.py logic) ---
     function parseIPv4(addrStr) {
@@ -2840,6 +2956,7 @@ INDEX_HTML = r"""<!doctype html>
       const tunnelVal = tunnelSubnet ? tunnelSubnet.value.trim() : "";
       if (!tunnelVal || !parseCidr(tunnelVal)) return false;
       if (selectedCiphers().length === 0) return false;
+      if (!validateMtuSettings()) return false;
       const certEls = [certC, certST, certL, certO, certOU, certEmail];
       if (certEls.some(el => !el || el.value.trim() === "")) return false;
       return true;
@@ -2862,6 +2979,101 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
 
+    function toggleMtuFixFields() {
+      const enabled = document.getElementById("enableMtuFix")?.checked;
+      const wrap = document.getElementById("mtuFixFields");
+      const presetRow = document.getElementById("mtuPresetRow");
+      if (!wrap) return;
+      wrap.style.display = enabled ? "flex" : "none";
+      if (presetRow) {
+        presetRow.style.display = enabled ? "flex" : "none";
+      }
+    }
+
+    function setMtuPresetManual() {
+      const presetEl = document.getElementById("mtuPreset");
+      if (presetEl) {
+        presetEl.value = "manual";
+      }
+    }
+
+    function applyMtuPreset(presetKey) {
+      if (presetKey === "manual") return;
+      const preset = MTU_PRESETS[presetKey];
+      if (!preset) return;
+      const mssEl = document.getElementById("mssfixValue");
+      const tunEl = document.getElementById("tunMtuValue");
+      if (mssEl) mssEl.value = String(preset.mssfix);
+      if (tunEl) tunEl.value = String(preset.tunMtu);
+    }
+
+    function inferMtuPreset(mssfix, tunMtu) {
+      const mss = Number(mssfix);
+      const tun = Number(tunMtu);
+      for (const [key, preset] of Object.entries(MTU_PRESETS)) {
+        if (preset.mssfix === mss && preset.tunMtu === tun) {
+          return key;
+        }
+      }
+      return "manual";
+    }
+
+    function validateMtuSettings() {
+      const enabledEl = document.getElementById("enableMtuFix");
+      const mssEl = document.getElementById("mssfixValue");
+      const tunEl = document.getElementById("tunMtuValue");
+      const box = document.getElementById("mtuErrorServer");
+      if (!enabledEl || !mssEl || !tunEl || !box) return true;
+
+      mssEl.classList.remove("input-error");
+      tunEl.classList.remove("input-error");
+
+      if (!enabledEl.checked) {
+        box.style.display = "none";
+        box.textContent = "";
+        return true;
+      }
+
+      const errors = [];
+      const mssRaw = (mssEl.value || "").trim();
+      const tunRaw = (tunEl.value || "").trim();
+
+      if (!/^\d+$/.test(mssRaw)) {
+        mssEl.classList.add("input-error");
+        errors.push("mssfix must be a positive integer.");
+      }
+      if (!/^\d+$/.test(tunRaw)) {
+        tunEl.classList.add("input-error");
+        errors.push("tun-mtu must be a positive integer.");
+      }
+
+      if (/^\d+$/.test(mssRaw)) {
+        const mss = parseInt(mssRaw, 10);
+        if (mss < 900 || mss > 1460) {
+          mssEl.classList.add("input-error");
+          errors.push("mssfix must be between 900 and 1460.");
+        }
+      }
+
+      if (/^\d+$/.test(tunRaw)) {
+        const tun = parseInt(tunRaw, 10);
+        if (tun < 1200 || tun > 2000) {
+          tunEl.classList.add("input-error");
+          errors.push("tun-mtu must be between 1200 and 2000.");
+        }
+      }
+
+      if (errors.length) {
+        box.style.display = "block";
+        box.innerHTML = "MTU/MSS validation:<br>" + errors.map(e => `&bull; ${e}`).join("<br>");
+        return false;
+      }
+
+      box.style.display = "none";
+      box.textContent = "";
+      return true;
+    }
+
     function initializeServer() {
       if (state.initialized && !reinitializeUnlocked) {
         openReinitializeWarning();
@@ -2872,7 +3084,11 @@ INDEX_HTML = r"""<!doctype html>
         initProgressBar.className = "progress-bar failed";
         return;
       }
+      if (!validateMtuSettings()) return;
       if (!validateSubnets()) return;
+      const mtuFixEnabled = document.getElementById("enableMtuFix")?.checked || false;
+      const mssfix = (document.getElementById("mssfixValue")?.value || "").trim();
+      const tunMtu = (document.getElementById("tunMtuValue")?.value || "").trim();
       const payload = {
         certificate_details: {
           C: certC.value, ST: certST.value, L: certL.value, O: certO.value,
@@ -2884,6 +3100,9 @@ INDEX_HTML = r"""<!doctype html>
         openvpn_tunnel_subnet: tunnelSubnet.value,
         server_lan_subnet: lanSubnet.value,
         data_ciphers: selectedCiphers(),
+        mtu_fix_enabled: mtuFixEnabled,
+        mssfix: mtuFixEnabled ? mssfix : null,
+        tun_mtu: mtuFixEnabled ? tunMtu : null,
         clients: collectClients("initClients")
       };
       const initPath = state.initialized ? "/api/reinitialize" : "/api/initialize";
@@ -2891,6 +3110,10 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function addClients() {
+      if (activeJobPath) {
+        setClientActionMessage("Please wait for the current operation to finish.", "muted");
+        return;
+      }
       const clients = collectClients("addClients");
       if (!clients.length) {
         setClientActionMessage("Enter a client name first.", "err");
@@ -2909,6 +3132,13 @@ INDEX_HTML = r"""<!doctype html>
         return;
       }
       runJob("/api/clients", {clients});
+    }
+
+    function setAddClientBusy(busy) {
+      const btn = document.getElementById("generateClientBtn");
+      if (!btn) return;
+      btn.disabled = !!busy;
+      btn.textContent = busy ? "Generating..." : "Generate Client";
     }
 
     function revokeClientByName(name) {
@@ -3095,6 +3325,10 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function runJob(path, payload) {
+      if (activeJobPath) {
+        setClientActionMessage("Please wait for the current operation to finish.", "muted");
+        return;
+      }
       api(path, payload).then(data => {
         activeJob = data.job_id;
         activeJobPath = path;
@@ -3104,6 +3338,7 @@ INDEX_HTML = r"""<!doctype html>
           initProgressOutput.textContent = "Running...";
           initProgressBar.className = "progress-bar running";
         } else if (path === "/api/clients") {
+          setAddClientBusy(true);
           setClientActionMessage("Generating client...", "pending");
         } else if (path === "/api/revoke") {
           const targetName = payload && payload.client_name ? payload.client_name : "client";
@@ -3119,6 +3354,9 @@ INDEX_HTML = r"""<!doctype html>
         }
         pollJob();
       }).catch(err => {
+        if (path === "/api/clients") {
+          setAddClientBusy(false);
+        }
         if (path === "/api/initialize" || path === "/api/reinitialize") {
           initProgressLabel.textContent = `Failed to start: ${err.message}`;
           initProgressBar.className = "progress-bar failed";
@@ -3155,6 +3393,9 @@ INDEX_HTML = r"""<!doctype html>
         if (job.status === "running") {
           setTimeout(pollJob, 1200);
         } else {
+          if (activeJobPath === "/api/clients") {
+            setAddClientBusy(false);
+          }
           if (activeJobPath === "/api/package" && activePackageTarget) {
             setPackageButtonBusy(activePackageTarget, false);
             activePackageTarget = "";
@@ -3194,6 +3435,7 @@ INDEX_HTML = r"""<!doctype html>
             const err = String(job.error || "Operation failed.").split("\n")[0];
             setClientActionMessage(err, "err");
           }
+          activeJob = null;
           activeJobPath = "";
           refreshStatus();
         }
@@ -3218,12 +3460,17 @@ INDEX_HTML = r"""<!doctype html>
       initializeBtn.disabled = (state.initialized && !reinitializeUnlocked) || !isInitializeFormReady();
 
       const details = state.server_details || {};
+      const mtuFixEnabled = Boolean(details.mtu_fix_enabled);
+      const mtuSummary = mtuFixEnabled
+        ? `Enabled (mssfix ${details.mssfix || "n/a"}, tun-mtu ${details.tun_mtu || "n/a"})`
+        : "Disabled";
       serverSummary.innerHTML = state.initialized
         ? `<table><tbody>
             <tr><th>Address</th><td>${details.server_address || ""}</td></tr>
             <tr><th>Port</th><td>${details.port || ""}</td></tr>
             <tr><th>Protocol</th><td>${details.proto || ""}</td></tr>
             <tr><th>Ciphers</th><td>${(details.data_ciphers || []).join(", ")}</td></tr>
+            <tr><th>MTU/MSS Fix</th><td>${mtuSummary}</td></tr>
           </tbody></table>
           <div class="actions" style="margin-top:10px;">
             <button type="button" class="warn" onclick="openReinitializeWarning()">Re-Initialize Server</button>
@@ -3289,17 +3536,26 @@ INDEX_HTML = r"""<!doctype html>
       const cert = state.certificate_details || {};
       // Do not clobber in-progress edits while the initialize modal is open.
       if (!initOverlay.classList.contains("show")) {
+        serverAddress.value = details.server_address || "";
+        serverPort.value = details.port || "1194";
+        serverProto.value = details.proto || "udp";
         certC.value = cert.C || "US";
         certST.value = cert.ST || "MO";
         certL.value = cert.L || "Mineral Point";
         certO.value = cert.O || "GregNet";
         certOU.value = cert.OU || "IT";
         certEmail.value = cert.email_address || "admin@example.com";
+        enableMtuFix.checked = mtuFixEnabled;
+        mssfixValue.value = details.mssfix || "1360";
+        tunMtuValue.value = details.tun_mtu || "1428";
+        mtuPreset.value = inferMtuPreset(mssfixValue.value, tunMtuValue.value);
+        toggleMtuFixFields();
       }
 
       validateInitClientNames();
       validateAddClientNames();
       validateAddClientSubnets();
+      validateMtuSettings();
       checkInitializeReady();
     }
 
