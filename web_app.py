@@ -351,9 +351,6 @@ def initialize_from_payload(payload: dict) -> dict:
     )
 
     created = []
-    mtu_fix_enabled = bool(server_details.get("mtu_fix_enabled", False))
-    mssfix_value = server_details.get("mssfix")
-    tun_mtu_value = server_details.get("tun_mtu")
     for client in clients:
         manage_client_creation(
             client["name"],
@@ -370,6 +367,9 @@ def initialize_from_payload(payload: dict) -> dict:
             list(data_ciphers),
             client_subnet_input=client["subnet"],
             prompt_for_subnet=False,
+            mtu_fix_enabled=mtu_fix_enabled,
+            mssfix_value=mssfix,
+            tun_mtu_value=tun_mtu,
         )
         created.append(client["name"])
 
@@ -475,6 +475,9 @@ def add_clients_from_payload(payload: dict) -> dict:
         raise ValueError("OpenVPN tunnel subnet not found. Initialize the server first.")
 
     created = []
+    mtu_fix_enabled = bool(server_details.get("mtu_fix_enabled", False))
+    mssfix_value = server_details.get("mssfix")
+    tun_mtu_value = server_details.get("tun_mtu")
     for client in clients:
         manage_client_creation(
             client["name"],
@@ -2964,6 +2967,7 @@ INDEX_HTML = r"""<!doctype html>
 
     function checkInitializeReady() {
       if (state.initialized && !reinitializeUnlocked) return;
+      validateServerAddress();
       validatePort();
       validateCiphers();
       initializeBtn.disabled = !isInitializeFormReady();
