@@ -13,6 +13,12 @@ This project includes a local Web GUI and can be packaged for Windows and Linux.
 
 ## Run In Python
 
+Install Python build dependencies first:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
 From this folder:
 
 ```powershell

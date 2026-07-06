@@ -1,0 +1,3 @@
+# Runtime uses Python standard library modules only.
+# PyInstaller is needed for packaging executable artifacts.
+pyinstaller>=6.21.0
