@@ -62,6 +62,7 @@ from main import (
 from openvpn_config import generate_server_conf
 from server_cert import generate_server_certificates
 from subnet_management import (
+  get_client_subnets,
     get_subnet_by_name,
     load_existing_subnets,
     save_subnet_to_csv,
@@ -162,6 +163,28 @@ def _resolve_runtime_asset_path(file_name: str) -> str:
       return bundled_path
 
   return disk_path
+
+
+def _resolve_runtime_screenshot_path(file_name: str) -> str | None:
+  normalized_name = os.path.basename(str(file_name or "").strip())
+  if not normalized_name:
+    return None
+  if normalized_name != file_name:
+    return None
+  if not normalized_name.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")):
+    return None
+
+  disk_path = os.path.join(BASE_DIR, "screenshots", normalized_name)
+  if os.path.isfile(disk_path):
+    return disk_path
+
+  bundle_dir = getattr(sys, "_MEIPASS", None)
+  if bundle_dir:
+    bundled_path = os.path.join(bundle_dir, "screenshots", normalized_name)
+    if os.path.isfile(bundled_path):
+      return bundled_path
+
+  return None
 
 
 def _validate_client_name(name: str) -> str:
@@ -824,24 +847,390 @@ def flexedge_guide_payload() -> dict:
     return payload
 
 
-def anybus_defender_guide_payload() -> dict:
-    guide_path = _resolve_runtime_asset_path("Deploy Server Setup to Anybus Defender.docx")
-    mtime = os.path.getmtime(guide_path) if os.path.exists(guide_path) else None
-    cached = _ANYBUS_DEFENDER_GUIDE_CACHE.get("payload")
-    if cached and _ANYBUS_DEFENDER_GUIDE_CACHE.get("mtime") == mtime:
-        return cached
+def _read_text_file_for_guide(file_path: str, *, max_bytes: int = 1024 * 1024) -> str | None:
+    if not os.path.exists(file_path):
+        return None
+    with open(file_path, "rb") as f:
+        raw = f.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError(f"Guide source file is too large: {os.path.basename(file_path)}")
+    return raw.decode("utf-8", errors="replace")
 
-    ns = {
-        "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
-        "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
-        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-        "rel": "http://schemas.openxmlformats.org/package/2006/relationships",
-    }
 
-    payload = _parse_docx_guide(guide_path, "Deploy Server Setup to Anybus Defender", ns)
-    _ANYBUS_DEFENDER_GUIDE_CACHE["mtime"] = mtime
-    _ANYBUS_DEFENDER_GUIDE_CACHE["payload"] = payload
+def _candidate_server_conf_paths() -> list[str]:
+    return [
+        os.path.join(BASE_DIR, "server", "server.conf"),
+        os.path.join(BASE_DIR, "dist", "server", "server.conf"),
+    ]
+
+
+def _first_existing_path(paths: list[str]) -> str | None:
+    for path in paths:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _extract_inline_conf_block(conf_text: str, tag_name: str) -> str:
+    pattern = rf"<{re.escape(tag_name)}>(.*?)</{re.escape(tag_name)}>"
+    match = re.search(pattern, conf_text, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
+def _parse_server_conf_local_port(conf_text: str) -> str:
+    for line in conf_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = re.match(r"^port\s+(\d+)\b", stripped, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _parse_server_conf_tls_key(conf_text: str, conf_dir: str) -> tuple[bool, str]:
+    inline_tls_key = _extract_inline_conf_block(conf_text, "tls-auth")
+    if inline_tls_key:
+        return True, inline_tls_key
+
+    for line in conf_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = re.match(r"^tls-auth\s+(.+?)\s*(?:\s+\d+)?$", stripped, flags=re.IGNORECASE)
+        if not match:
+            continue
+        raw_path = (match.group(1) or "").strip().strip('"\'')
+        if not raw_path:
+            return True, ""
+
+        if os.path.isabs(raw_path):
+            tls_key_path = raw_path
+        else:
+            tls_key_path = os.path.join(conf_dir, raw_path)
+
+        tls_key_content = _read_text_file_for_guide(tls_key_path) or ""
+        return True, tls_key_content.strip()
+
+    return False, ""
+
+
+def _parse_server_conf_directives(conf_text: str) -> list[tuple[str, str, str]]:
+    directives: list[tuple[str, str, str]] = []
+    in_inline_block = False
+    for raw_line in conf_text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+
+        if re.match(r"^<[^/][^>]*>$", stripped):
+            in_inline_block = True
+            continue
+        if re.match(r"^</[^>]+>$", stripped):
+            in_inline_block = False
+            continue
+        if in_inline_block:
+            continue
+
+        if stripped.startswith("#"):
+            continue
+
+        cleaned = raw_line.split("#", 1)[0].strip()
+        if not cleaned:
+            continue
+
+        parts = cleaned.split(maxsplit=1)
+        name = parts[0].lower()
+        value = parts[1].strip() if len(parts) > 1 else ""
+        directives.append((name, value, cleaned))
+    return directives
+
+
+def _get_first_directive_value(
+    directives: list[tuple[str, str, str]],
+    name: str,
+) -> str:
+    name = name.lower()
+    for directive_name, directive_value, _ in directives:
+        if directive_name == name:
+            return directive_value
+    return ""
+
+
+def _extract_conf_section_lines(conf_text: str, start_marker: str, end_marker: str) -> list[str]:
+    in_section = False
+    out: list[str] = []
+    for raw_line in conf_text.splitlines():
+        line = raw_line.strip()
+        if line == start_marker:
+            in_section = True
+            continue
+        if line == end_marker:
+            break
+        if not in_section:
+            continue
+        if not line or line.startswith("#"):
+            continue
+        cleaned = raw_line.split("#", 1)[0].strip()
+        if cleaned:
+            out.append(cleaned)
+    return out
+
+
+def _add_semicolon(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    return value if value.endswith(";") else f"{value};"
+
+
+def _unique_keep_order(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _build_anybus_custom_options(conf_text: str, directives: list[tuple[str, str, str]]) -> list[str]:
+    custom_lines: list[str] = []
+
+    # Prefer the explicit client subnet section comments if present.
+    custom_lines.extend(
+        _extract_conf_section_lines(
+            conf_text,
+            "## Client Subnets ##",
+            "## End of Client Subnets ##",
+        )
+    )
+
+    # Include additional directives frequently entered in Anybus custom options.
+    for directive_name in ["management", "mssfix", "tun-mtu"]:
+        for name, value, cleaned in directives:
+            if name == directive_name:
+                custom_lines.append(cleaned if cleaned else f"{name} {value}".strip())
+
+    custom_lines = [_add_semicolon(line) for line in custom_lines if line.strip()]
+    return _unique_keep_order(custom_lines)
+
+
+def _split_data_ciphers(data_ciphers_value: str) -> list[str]:
+    return [item.strip() for item in (data_ciphers_value or "").split(":") if item.strip()]
+
+
+def _candidate_ccd_dirs() -> list[str]:
+  return [
+    os.path.join(BASE_DIR, "server", "ccd"),
+    os.path.join(BASE_DIR, "dist", "server", "ccd"),
+  ]
+
+
+def _collect_anybus_ccd_overrides() -> list[dict]:
+  ccd_dir = _first_existing_path(_candidate_ccd_dirs())
+  if not ccd_dir or not os.path.isdir(ccd_dir):
+    return []
+
+  overrides: list[dict] = []
+  for name in sorted(os.listdir(ccd_dir)):
+    if name.startswith("."):
+      continue
+    ccd_file = os.path.join(ccd_dir, name)
+    if not os.path.isfile(ccd_file):
+      continue
+
+    content = _read_text_file_for_guide(ccd_file) or ""
+    raw_lines = []
+    for line in content.splitlines():
+      cleaned = line.split("#", 1)[0].strip()
+      if cleaned:
+        raw_lines.append(cleaned)
+
+    advanced_lines = [_add_semicolon(line) for line in raw_lines if line]
+    overrides.append(
+      {
+        "client_name": name,
+        "ccd_file": ccd_file,
+        "raw_lines": raw_lines,
+        "advanced_options_lines": advanced_lines,
+        "advanced_options_text": "\n".join(advanced_lines),
+      }
+    )
+
+  if overrides:
+    return overrides
+
+  # Fallback: derive equivalent client-specific override lines from subnets.csv.
+  for client_name, subnet in get_client_subnets(SUBNETS_CSV).items():
+    iroute_line = f"iroute {subnet.network_address} {subnet.netmask}"
+    overrides.append(
+      {
+        "client_name": client_name,
+        "ccd_file": "(derived from subnets.csv)",
+        "raw_lines": [iroute_line],
+        "advanced_options_lines": [_add_semicolon(iroute_line)],
+        "advanced_options_text": _add_semicolon(iroute_line),
+      }
+    )
+
+  return overrides
+
+
+def _anybus_defender_dynamic_materials() -> dict:
+    ca_dir = os.path.join(BASE_DIR, "ca")
+    server_dir = os.path.join(BASE_DIR, "server")
+    fields = [
+        ("ca_crt", "ca.crt", os.path.join(ca_dir, "ca.crt")),
+        ("ca_key", "ca.key", os.path.join(ca_dir, "ca.key")),
+        ("server_crt", "server.crt", os.path.join(server_dir, "server.crt")),
+        ("server_key", "server.key", os.path.join(server_dir, "server.key")),
+        ("crl_pem", "crl.pem", os.path.join(ca_dir, "crl.pem")),
+    ]
+
+    payload: dict[str, dict] = {}
+    for key, file_name, path in fields:
+        try:
+            content = _read_text_file_for_guide(path)
+        except Exception as exc:
+            payload[key] = {
+                "file": file_name,
+                "available": False,
+                "error": str(exc),
+                "content": "",
+            }
+            continue
+
+        payload[key] = {
+            "file": file_name,
+            "available": content is not None,
+            "content": content or "",
+        }
+
+    conf_path = _first_existing_path(_candidate_server_conf_paths())
+    conf_content = ""
+    if conf_path:
+        try:
+            conf_content = _read_text_file_for_guide(conf_path) or ""
+        except Exception as exc:
+            payload["server_conf"] = {
+                "file": os.path.basename(conf_path),
+                "available": False,
+                "error": str(exc),
+                "content": "",
+            }
+            payload["local_port"] = {"available": False, "content": ""}
+            payload["tls_key_enabled"] = {"available": False, "content": ""}
+            payload["ta_key"] = {"available": False, "content": ""}
+            return payload
+
+        local_port = _parse_server_conf_local_port(conf_content)
+        tls_enabled, tls_key_content = _parse_server_conf_tls_key(
+            conf_content,
+            os.path.dirname(conf_path),
+        )
+        directives = _parse_server_conf_directives(conf_content)
+
+        proto = _get_first_directive_value(directives, "proto")
+        key_direction = _get_first_directive_value(directives, "key-direction")
+        data_ciphers_raw = _get_first_directive_value(directives, "data-ciphers")
+        data_ciphers_fallback = _get_first_directive_value(directives, "data-ciphers-fallback")
+        custom_options_lines = _build_anybus_custom_options(conf_content, directives)
+        ccd_overrides = _collect_anybus_ccd_overrides()
+        server_lan_subnet = get_subnet_by_name(SUBNETS_CSV, "server_local_private_subnet")
+        openvpn_tunnel_subnet = get_subnet_by_name(SUBNETS_CSV, "openvpn_tunnel_subnet")
+
+        payload["server_conf"] = {
+            "file": os.path.basename(conf_path),
+            "available": True,
+            "content": conf_content,
+        }
+        payload["local_port"] = {
+            "file": os.path.basename(conf_path),
+            "available": bool(local_port),
+            "content": local_port,
+        }
+        payload["tls_key_enabled"] = {
+            "file": os.path.basename(conf_path),
+            "available": True,
+            "content": "Yes" if tls_enabled else "No",
+        }
+        payload["ta_key"] = {
+            "file": "ta.key",
+            "available": tls_enabled and bool(tls_key_content),
+            "content": tls_key_content,
+        }
+        payload["anybus_plan"] = {
+          "available": True,
+          "protocol": proto,
+          "local_port": local_port,
+          "tls_key_enabled": "Yes" if tls_enabled else "No",
+          "tls_key_direction": key_direction,
+          "peer_certificate_authority": "Imported Certificate Authority (ca.crt/ca.key)",
+          "peer_certificate_authority_available": bool(payload.get("ca_crt", {}).get("available")),
+          "peer_certificate_revocation_list": "Imported CRL File (crl.pem)",
+          "peer_certificate_revocation_list_available": bool(payload.get("crl_pem", {}).get("available")),
+          "server_certificate_selection": "Imported Server Cert/Key (server.crt/server.key)",
+          "server_certificate_selection_available": bool(payload.get("server_crt", {}).get("available") and payload.get("server_key", {}).get("available")),
+          "data_ciphers": _split_data_ciphers(data_ciphers_raw),
+          "data_ciphers_fallback": data_ciphers_fallback,
+          "custom_options_lines": custom_options_lines,
+          "custom_options_text": "\n".join(custom_options_lines),
+          "ccd_overrides": ccd_overrides,
+          "ipv4_tunnel_network_hint": str(openvpn_tunnel_subnet) if openvpn_tunnel_subnet else "",
+          "ipv4_local_networks_hint": str(server_lan_subnet) if server_lan_subnet else "",
+          "excluded_directives": [
+            "client-config-dir ccd",
+            "status openvpn-status.log",
+            "log-append openvpn.log",
+          ],
+          "cert_import_locations": [
+            "System > Certificate Manager > CAs: import ca.crt and ca.key",
+            "System > Certificate Manager > Certificates: import server.crt and server.key",
+            "System > Certificate Manager > Certificate Revocation: import crl.pem",
+          ],
+        }
+    else:
+        payload["server_conf"] = {
+            "file": "server.conf",
+            "available": False,
+            "content": "",
+            "error": "server.conf was not found.",
+        }
+        payload["local_port"] = {"available": False, "content": ""}
+        payload["tls_key_enabled"] = {"available": False, "content": ""}
+        payload["ta_key"] = {"available": False, "content": ""}
+        payload["anybus_plan"] = {
+          "available": False,
+          "peer_certificate_authority": "",
+          "peer_certificate_authority_available": False,
+          "peer_certificate_revocation_list": "",
+          "peer_certificate_revocation_list_available": False,
+          "server_certificate_selection": "",
+          "server_certificate_selection_available": False,
+          "custom_options_lines": [],
+          "custom_options_text": "",
+          "ccd_overrides": [],
+          "ipv4_tunnel_network_hint": "",
+          "ipv4_local_networks_hint": "",
+          "data_ciphers": [],
+          "data_ciphers_fallback": "",
+          "excluded_directives": [],
+          "cert_import_locations": [],
+        }
+
     return payload
+
+
+def anybus_defender_guide_payload() -> dict:
+    return {
+    "title": "Anybus Defender Copy/Paste Setup Guide",
+    "html": "",
+        "dynamic_materials": _anybus_defender_dynamic_materials(),
+    }
 
 
 def _subnets() -> list[dict]:
@@ -1288,11 +1677,21 @@ class ToolkitHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
 
+    @staticmethod
+    def _is_client_disconnect_error(exc: BaseException) -> bool:
+        return isinstance(exc, (BrokenPipeError, ConnectionResetError))
+
     def do_GET(self):
         _touch_activity()
         parsed = urlparse(self.path)
         if parsed.path == "/":
             return self._send_html(INDEX_HTML)
+        if parsed.path.startswith("/api/screenshots/"):
+          image_name = posixpath.basename(parsed.path.rsplit("/", 1)[-1])
+          image_path = _resolve_runtime_screenshot_path(image_name)
+          if image_path:
+            return self._send_file(image_path, as_attachment=False)
+          return self._send_json({"error": "File not found."}, HTTPStatus.NOT_FOUND)
         if parsed.path == "/favicon.ico":
             icon_path = _resolve_runtime_icon_path()
             if icon_path:
@@ -1444,36 +1843,51 @@ class ToolkitHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, data, status=HTTPStatus.OK):
         body = json.dumps(data, default=_json_default).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:
+            if self._is_client_disconnect_error(exc):
+                return
+            raise
 
     def _send_html(self, html: str):
         html = html.replace("__CSRF_TOKEN__", _CSRF_TOKEN)
         body = html.encode("utf-8")
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:
+            if self._is_client_disconnect_error(exc):
+                return
+            raise
 
     def _send_file(self, file_path: str, as_attachment: bool = True):
         if not os.path.exists(file_path) or not os.path.isfile(file_path):
             return self._send_json({"error": "File not found."}, HTTPStatus.NOT_FOUND)
         content_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", content_type)
-        if as_attachment:
-            self.send_header(
-                "Content-Disposition",
-                f'attachment; filename="{os.path.basename(file_path)}"',
-            )
-        self.send_header("Content-Length", str(os.path.getsize(file_path)))
-        self.end_headers()
-        with open(file_path, "rb") as f:
-            shutil.copyfileobj(f, self.wfile)
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            if as_attachment:
+                self.send_header(
+                    "Content-Disposition",
+                    f'attachment; filename="{os.path.basename(file_path)}"',
+                )
+            self.send_header("Content-Length", str(os.path.getsize(file_path)))
+            self.end_headers()
+            with open(file_path, "rb") as f:
+                shutil.copyfileobj(f, self.wfile)
+        except Exception as exc:
+            if self._is_client_disconnect_error(exc):
+                return
+            raise
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -1816,6 +2230,108 @@ INDEX_HTML = r"""<!doctype html>
       margin: 10px 0 16px;
       border: 1px solid var(--line);
       border-radius: 8px;
+    }
+    .dynamic-materials {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-soft);
+      padding: 10px;
+      margin: 0 0 14px;
+    }
+    .dynamic-materials h3 {
+      margin: 0 0 8px;
+      font-size: 15px;
+    }
+    .dynamic-materials p {
+      margin: 0 0 8px;
+    }
+    .dynamic-material-block {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+      padding: 8px;
+      margin-bottom: 10px;
+    }
+    .dynamic-material-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 6px;
+      flex-wrap: wrap;
+    }
+    .dynamic-material-head strong {
+      font-size: 13px;
+    }
+    .dynamic-material-value {
+      width: 100%;
+      min-height: 120px;
+      resize: vertical;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .dynamic-material-copy-status {
+      color: var(--muted);
+      font-size: 12px;
+      margin-left: 6px;
+    }
+    .dynamic-material-list {
+      margin: 0;
+      padding-left: 18px;
+    }
+    .dynamic-material-list li {
+      margin: 0 0 6px;
+    }
+    .anybus-section {
+      display: block;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-soft);
+      margin: 0 0 14px;
+      overflow: hidden;
+    }
+    .anybus-section-title {
+      margin: 0;
+      padding: 8px 10px;
+      background: rgba(10, 40, 66, 0.9);
+      color: #e9f2ff;
+      font-size: 14px;
+      font-weight: 700;
+      border-bottom: 1px solid var(--line);
+    }
+    .anybus-section-body {
+      padding: 10px;
+    }
+    .anybus-step-line {
+      margin: 0 0 8px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+    .anybus-shot-grid {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .anybus-shot {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-soft);
+      padding: 6px;
+    }
+    .anybus-shot img {
+      width: 100%;
+      height: auto;
+      border-radius: 6px;
+      margin: 0;
+      cursor: zoom-in;
+    }
+    .anybus-shot figcaption {
+      margin-top: 6px;
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.35;
     }
     @media (max-width: 820px) {
       main { grid-template-columns: 1fr; }
@@ -2431,22 +2947,384 @@ INDEX_HTML = r"""<!doctype html>
       flexedgeGuideOverlay.setAttribute("aria-hidden", "true");
     }
 
+    async function copyTextToClipboard(text) {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        return;
+      }
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "readonly");
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      if (!ok) {
+        throw new Error("Clipboard copy failed.");
+      }
+    }
+
+    function anybusScreenshotUrl(fileName) {
+      return `/api/screenshots/${encodeURIComponent(String(fileName || ""))}`;
+    }
+
+    function buildAnybusScreenshotGallery(shots) {
+      if (!Array.isArray(shots) || !shots.length) {
+        return null;
+      }
+      const grid = document.createElement("div");
+      grid.className = "anybus-shot-grid";
+
+      shots.forEach(shot => {
+        const file = String((shot && shot.file) || "").trim();
+        if (!file) {
+          return;
+        }
+
+        const figure = document.createElement("figure");
+        figure.className = "anybus-shot";
+
+        const img = document.createElement("img");
+        img.src = anybusScreenshotUrl(file);
+        img.alt = String((shot && shot.caption) || file);
+        img.loading = "lazy";
+        img.addEventListener("click", () => {
+          window.open(img.src, "_blank", "noopener,noreferrer");
+        });
+        img.addEventListener("error", () => {
+          figure.remove();
+        });
+        figure.appendChild(img);
+
+        const caption = String((shot && shot.caption) || "").trim();
+        if (caption) {
+          const figcap = document.createElement("figcaption");
+          figcap.textContent = `${file} - ${caption}`;
+          figure.appendChild(figcap);
+        }
+
+        grid.appendChild(figure);
+      });
+
+      return grid.childElementCount ? grid : null;
+    }
+
+    function buildAnybusCopyBlock(label, value) {
+      const block = document.createElement("div");
+      block.className = "dynamic-material-block";
+
+      const head = document.createElement("div");
+      head.className = "dynamic-material-head";
+      const title = document.createElement("strong");
+      title.textContent = label;
+      head.appendChild(title);
+
+      const actions = document.createElement("div");
+      actions.className = "actions";
+      const copyBtn = document.createElement("button");
+      copyBtn.type = "button";
+      copyBtn.className = "secondary";
+      copyBtn.textContent = "Copy";
+
+      const status = document.createElement("span");
+      status.className = "dynamic-material-copy-status";
+      copyBtn.addEventListener("click", async () => {
+        try {
+          await copyTextToClipboard(String(value || ""));
+          status.textContent = "Copied";
+          setTimeout(() => {
+            status.textContent = "";
+          }, 1500);
+        } catch (_) {
+          status.textContent = "Copy failed";
+        }
+      });
+
+      actions.appendChild(copyBtn);
+      actions.appendChild(status);
+      head.appendChild(actions);
+      block.appendChild(head);
+
+      const ta = document.createElement("textarea");
+      ta.className = "dynamic-material-value";
+      ta.readOnly = true;
+      ta.value = String(value || "");
+      if (!String(value || "").trim()) {
+        ta.value = "[Value not found yet. Initialize or regenerate server artifacts, then reopen this guide.]";
+      }
+      block.appendChild(ta);
+
+      return block;
+    }
+
+    function buildAnybusSection(titleText) {
+      const section = document.createElement("section");
+      section.className = "anybus-section";
+
+      const title = document.createElement("h4");
+      title.className = "anybus-section-title";
+      title.textContent = titleText;
+      section.appendChild(title);
+
+      const body = document.createElement("div");
+      body.className = "anybus-section-body";
+      section.appendChild(body);
+
+      return { section, body };
+    }
+
+    function appendAnybusLine(container, text, muted = false) {
+      const p = document.createElement("p");
+      p.className = muted ? "anybus-step-line muted" : "anybus-step-line";
+      p.textContent = text;
+      container.appendChild(p);
+      return p;
+    }
+
+    function appendAnybusShots(container, shots) {
+      const gallery = buildAnybusScreenshotGallery(shots);
+      if (gallery) {
+        container.appendChild(gallery);
+      }
+    }
+
+    function renderAnybusDynamicMaterials(materials) {
+      const plan = (materials && materials.anybus_plan) || {};
+      const getContent = (key) => String((((materials || {})[key] || {}).content) || "");
+
+      const caCrt = getContent("ca_crt");
+      const caKey = getContent("ca_key");
+      const serverCrt = getContent("server_crt");
+      const serverKey = getContent("server_key");
+      const crlPem = getContent("crl_pem");
+      const taKey = getContent("ta_key");
+
+      const missingData = [caCrt, caKey, serverCrt, serverKey, crlPem, taKey].every(v => !String(v).trim());
+
+      const sec1 = buildAnybusSection("Step 1: Certificate Manager Imports");
+      if (missingData) {
+        appendAnybusLine(
+          sec1.body,
+          "Generated cert/key content is not available in this runtime yet. The layout still shows the exact order and target fields.",
+          true,
+        );
+      }
+      appendAnybusLine(sec1.body, "Step 1a. Navigate to System > Certificate Manager.");
+      appendAnybusShots(sec1.body, [
+        { file: "image1.png", caption: "Open System menu and select Certificate Manager." },
+        { file: "image2.png", caption: "Certificate Manager > CAs page." },
+      ]);
+      appendAnybusLine(sec1.body, "Step 1b. Click CAs, then Add/Edit (or pencil icon).", true);
+      appendAnybusShots(sec1.body, [
+        { file: "image2a.png", caption: "CA Add/Edit entry point." },
+      ]);
+      appendAnybusShots(sec1.body, [
+        { file: "image3.png", caption: "Create/Edit CA form." },
+      ]);
+      appendAnybusLine(sec1.body, "Step 1c. Set Method to Import existing CA and Trust Store to Yes. Copy CA certificate and private key, paste them, then Save.", true);
+      sec1.body.appendChild(buildAnybusCopyBlock("CA Certificate (ca.crt)", caCrt));
+      sec1.body.appendChild(buildAnybusCopyBlock("CA Private Key (ca.key)", caKey));
+      appendAnybusShots(sec1.body, [
+        { file: "image5.png", caption: "CA Certificate data + private key data fields and Save." },
+      ]);
+
+      appendAnybusLine(sec1.body, "Step 1d. Navigate to System > Certificate Manager > Certificates.");
+      appendAnybusShots(sec1.body, [
+        { file: "image6.png", caption: "Certificates tab." },
+      ]);
+      appendAnybusLine(sec1.body, "Step 1e. Open Add/Edit certificate. Set Method = Import existing certificate, Certificate Type = X.509 (PEM).", true);
+      appendAnybusShots(sec1.body, [
+        { file: "image7.png", caption: "Certificate import form." },
+      ]);
+      appendAnybusLine(sec1.body, "Step 1f. Copy server certificate and private key, paste both fields, then Save.");
+      sec1.body.appendChild(buildAnybusCopyBlock("Server Certificate (server.crt)", serverCrt));
+      sec1.body.appendChild(buildAnybusCopyBlock("Server Private Key (server.key)", serverKey));
+      appendAnybusShots(sec1.body, [
+        { file: "image8.png", caption: "Server certificate data + private key data fields." },
+        { file: "image10.png", caption: "Save button." },
+      ]);
+
+      appendAnybusLine(sec1.body, "Step 1g. Navigate to System > Certificate Manager > Certificate Revocation.");
+      appendAnybusShots(sec1.body, [
+        { file: "image11.png", caption: "Certificate Revocation tab." },
+        { file: "image12.png", caption: "Select Certificate Authority and click Add." },
+        { file: "image13.png", caption: "CRL descriptive name field." },
+      ]);
+      appendAnybusLine(sec1.body, "Step 1h. Copy CRL data, paste into CRL field, then Save.", true);
+      sec1.body.appendChild(buildAnybusCopyBlock("Certificate Revocation List (crl.pem)", crlPem));
+      appendAnybusShots(sec1.body, [
+        { file: "image15.png", caption: "CRL data field + Save." },
+      ]);
+      anybusDefenderGuideContent.appendChild(sec1.section);
+
+      const sec2 = buildAnybusSection("Step 2: VPN > OpenVPN > Servers > Add/Edit");
+      appendAnybusLine(sec2.body, "Step 2a. Navigate to VPN > OpenVPN > Servers and click Add.");
+      appendAnybusShots(sec2.body, [
+        { file: "image17.png", caption: "OpenVPN servers list." },
+        { file: "image19.png", caption: "Server setup page." },
+      ]);
+
+      const protocol = String(plan.protocol || "").trim();
+      const localPort = String(plan.local_port || "").trim();
+      const tlsEnabled = String(plan.tls_key_enabled || "No").trim() || "No";
+      const tlsDir = String(plan.tls_key_direction || "").trim();
+      const peerCaSelection = String(plan.peer_certificate_authority || "").trim();
+      const peerCaSelectionAvailable = Boolean(plan.peer_certificate_authority_available);
+      const peerCrlSelection = String(plan.peer_certificate_revocation_list || "").trim();
+      const peerCrlSelectionAvailable = Boolean(plan.peer_certificate_revocation_list_available);
+      const serverCertSelection = String(plan.server_certificate_selection || "").trim();
+      const serverCertSelectionAvailable = Boolean(plan.server_certificate_selection_available);
+
+      appendAnybusLine(sec2.body, `Step 2b. Set Protocol/Port from EZ OpenVPN Toolkit output: protocol=${protocol || "(missing from Toolkit output)"}, local port=${localPort || "(missing from Toolkit output)"}.`, true);
+      appendAnybusShots(sec2.body, [
+        { file: "image19a.png", caption: "Protocol and local port fields." },
+        { file: "image19b.png", caption: "Protocol/port values applied from Toolkit output." },
+      ]);
+      appendAnybusLine(sec2.body, `Step 2c. TLS Configuration: Use a TLS key=${tlsEnabled}${tlsDir ? `, key direction=${tlsDir}` : ""}.`, true);
+      appendAnybusShots(sec2.body, [
+        { file: "image19c.png", caption: "TLS key section." },
+        { file: "image19d.png", caption: "TLS key direction and related fields." },
+      ]);
+
+      if (tlsEnabled === "Yes" && String(taKey).trim()) {
+        appendAnybusLine(sec2.body, "Step 2d. Copy TLS key data and paste it into TLS Key field.");
+        sec2.body.appendChild(buildAnybusCopyBlock("TLS Key (ta.key)", taKey));
+      }
+
+      appendAnybusShots(sec2.body, [
+        { file: "image20.png", caption: "TLS key options." },
+      ]);
+
+      appendAnybusLine(sec2.body, `Step 2e. Peer Certificate Authority = Choose imported Certificate Authority from the dropdown (${peerCaSelection || "missing from Toolkit output"}).`, true);
+      appendAnybusShots(sec2.body, [
+        { file: "image20a.png", caption: "Peer Certificate Authority dropdown." },
+      ]);
+      appendAnybusLine(sec2.body, `Peer Certificate Revocation List = Choose imported CRL File from the dropdown (${peerCrlSelection || "missing from Toolkit output"}).`, true);
+      appendAnybusShots(sec2.body, [
+        { file: "image20b.png", caption: "Peer Certificate Revocation List dropdown." },
+      ]);
+      appendAnybusLine(sec2.body, `Server Certificate = Choose imported Server Cert/Key from the dropdown (${serverCertSelection || "missing from Toolkit output"}).`, true);
+      appendAnybusShots(sec2.body, [
+        { file: "image20c.png", caption: "Server Certificate dropdown." },
+      ]);
+      if (!peerCaSelectionAvailable || !peerCrlSelectionAvailable || !serverCertSelectionAvailable) {
+        appendAnybusLine(sec2.body, "One or more Step 2e selections are missing from Toolkit-generated artifacts; regenerate/import cert materials first.", true);
+      }
+
+      const cipherList = Array.isArray(plan.data_ciphers) ? plan.data_ciphers.filter(Boolean) : [];
+      if (cipherList.length) {
+        appendAnybusLine(sec2.body, `Step 2f. Data Encryption Algorithms: ${cipherList.join(", ")}.`, true);
+      }
+      const fallbackCipher = String(plan.data_ciphers_fallback || "").trim();
+      if (fallbackCipher) {
+        appendAnybusLine(sec2.body, `Fallback Data Encryption Algorithm: ${fallbackCipher}.`, true);
+      }
+      appendAnybusShots(sec2.body, [
+        { file: "image22.png", caption: "Certificate and crypto sections." },
+      ]);
+      const ipv4TunnelHint = String(plan.ipv4_tunnel_network_hint || "").trim();
+      if (ipv4TunnelHint) {
+        appendAnybusLine(sec2.body, `Step 2g. IPv4 Tunnel Network suggestion: ${ipv4TunnelHint}.`, true);
+      } else {
+        appendAnybusLine(sec2.body, "Step 2g. IPv4 Tunnel Network suggestion: (missing from Toolkit output).", true);
+      }
+      appendAnybusLine(sec2.body, "The IPv4 Tunnel Network is the private virtual network used exclusively for VPN clients.", true);
+      appendAnybusLine(sec2.body, "Each client receives an IP address from this network, allowing OpenVPN to securely route encrypted traffic to your local network.");
+      appendAnybusShots(sec2.body, [
+        { file: "image24.png", caption: "Tunnel settings section." },
+      ]);
+      const ipv4Hint = String(plan.ipv4_local_networks_hint || "").trim();
+      if (ipv4Hint) {
+        appendAnybusLine(sec2.body, `Step 2h. IPv4 Local Networks suggestion: ${ipv4Hint}.`, true);
+      } else {
+        appendAnybusLine(sec2.body, "Step 2h. IPv4 Local Networks suggestion: (missing from Toolkit output).", true);
+      }
+      appendAnybusLine(sec2.body, "These are the local network(s) that VPN clients can access after connecting.", true);
+      appendAnybusLine(sec2.body, "Traffic to these networks is securely routed through the VPN tunnel.");
+      appendAnybusShots(sec2.body, [{ file: "image25.png", caption: "Save button in server form." }]);
+      anybusDefenderGuideContent.appendChild(sec2.section);
+
+      const sec3 = buildAnybusSection("Step 3: Advanced Configuration > Custom options");
+      appendAnybusLine(sec3.body, "Step 3a. Copy the generated custom options block, paste into Custom options, then Save.");
+      sec3.body.appendChild(buildAnybusCopyBlock("Custom options (semicolon format)", String(plan.custom_options_text || "")));
+      appendAnybusShots(sec3.body, [
+        { file: "image27.png", caption: "Advanced Configuration > Custom options field." },
+        { file: "image29.png", caption: "Custom options pasted." },
+        { file: "image30.png", caption: "Save button in advanced configuration section." },
+      ]);
+      anybusDefenderGuideContent.appendChild(sec3.section);
+
+      const sec4 = buildAnybusSection("Step 4: Client Specific Overrides");
+      appendAnybusLine(sec4.body, "Step 4a. Navigate to VPN > OpenVPN > Client Specific Overrides and click Add/Edit.");
+      appendAnybusLine(sec4.body, "Step 4b. Common Name must exactly match the client certificate CN.", true);
+      appendAnybusShots(sec4.body, [
+        { file: "image32.png", caption: "Client Specific Overrides page." },
+        { file: "image33.png", caption: "Override general/tunnel settings." },
+      ]);
+
+      const overrides = Array.isArray(plan.ccd_overrides) ? plan.ccd_overrides : [];
+      if (!overrides.length) {
+        appendAnybusLine(sec4.body, "No client override data found yet.", true);
+      } else {
+        overrides.forEach(ovr => {
+          const clientName = String((ovr && ovr.client_name) || "").trim();
+          const advancedText = String((ovr && ovr.advanced_options_text) || "");
+          appendAnybusLine(sec4.body, `Override for client: ${clientName || "(unknown)"}`);
+          appendAnybusLine(sec4.body, `Common Name field: ${clientName || "(match cert CN)"}.`, true);
+          sec4.body.appendChild(buildAnybusCopyBlock("Client Settings > Advanced (semicolon format)", advancedText));
+        });
+      }
+      appendAnybusShots(sec4.body, [
+        { file: "image34.png", caption: "Client Settings > Advanced iroute field." },
+      ]);
+      anybusDefenderGuideContent.appendChild(sec4.section);
+
+      const sec5 = buildAnybusSection("Step 5: Firewall Rules");
+      appendAnybusLine(sec5.body, "Step 5a. WAN rules: allow inbound OpenVPN server port to Anybus Defender.");
+      appendAnybusShots(sec5.body, [
+        { file: "image35.png", caption: "WAN tab with OpenVPN port rule." },
+      ]);
+      appendAnybusLine(sec5.body, "Step 5b. LAN rules: allow OpenVPN tunnel network to required LAN networks.", true);
+      appendAnybusShots(sec5.body, [
+        { file: "image36.png", caption: "LAN/LOCALAREA tab." },
+        { file: "image37.png", caption: "LAN/LOCALAREA rule details." },
+      ]);
+      appendAnybusLine(sec5.body, "Step 5c. OpenVPN rules: allow OpenVPN tunnel and LAN/local networks to communicate.", true);
+      appendAnybusShots(sec5.body, [
+        { file: "image38.png", caption: "OpenVPN tab rules." },
+      ]);
+      anybusDefenderGuideContent.appendChild(sec5.section);
+    }
+
     function openAnybusDefenderGuideModal() {
       anybusDefenderGuideOverlay.classList.add("show");
       anybusDefenderGuideOverlay.setAttribute("aria-hidden", "false");
-      if (!anybusDefenderGuideLoaded) {
-        anybusDefenderGuideContent.className = "guide-content muted";
-        anybusDefenderGuideContent.textContent = "Loading guide...";
-        api("/api/anybus-defender-guide").then(data => {
-          anybusDefenderGuideTitle.textContent = data.title || "Deploy Server Setup to Anybus Defender";
-          anybusDefenderGuideContent.className = "guide-content";
-          anybusDefenderGuideContent.innerHTML = data.html || "<p>No guide content found.</p>";
-          anybusDefenderGuideLoaded = true;
-        }).catch(err => {
-          anybusDefenderGuideContent.className = "guide-content";
-          anybusDefenderGuideContent.innerHTML = `<p>Failed to load guide: ${String(err.message || err)}</p>`;
-        });
+      const dialog = anybusDefenderGuideOverlay.querySelector(".dialog.guide-dialog");
+      if (dialog) {
+        dialog.scrollTop = 0;
       }
+      anybusDefenderGuideContent.className = "guide-content muted";
+      anybusDefenderGuideContent.textContent = "Loading copy/paste setup guide...";
+      api("/api/anybus-defender-guide").then(data => {
+        anybusDefenderGuideTitle.textContent = data.title || "Anybus Defender Copy/Paste Setup Guide";
+        anybusDefenderGuideContent.className = "guide-content";
+        anybusDefenderGuideContent.innerHTML = "";
+        try {
+          renderAnybusDynamicMaterials(data.dynamic_materials || {});
+        } catch (renderErr) {
+          anybusDefenderGuideContent.innerHTML = `<p>Failed to render Anybus guide layout: ${String(renderErr && renderErr.message || renderErr)}</p>`;
+        }
+        if (dialog) {
+          dialog.scrollTop = 0;
+        }
+        anybusDefenderGuideLoaded = true;
+      }).catch(err => {
+        anybusDefenderGuideContent.className = "guide-content";
+        anybusDefenderGuideContent.innerHTML = `<p>Failed to load guide: ${String(err.message || err)}</p>`;
+      });
     }
 
     function closeAnybusDefenderGuideModal() {
@@ -2650,6 +3528,15 @@ INDEX_HTML = r"""<!doctype html>
         body: body ? JSON.stringify(body) : undefined
       }).then(async res => {
         const data = await res.json();
+        if (res.status === 403) {
+          if (!window.__csrfRefreshInProgress) {
+            window.__csrfRefreshInProgress = true;
+            setTimeout(() => {
+              window.location.reload();
+            }, 150);
+          }
+          throw new Error("Session expired after app restart. Reloading page...");
+        }
         if (!res.ok) throw new Error(data.error || res.statusText);
         return data;
       });

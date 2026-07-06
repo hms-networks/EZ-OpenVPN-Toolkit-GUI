@@ -40,6 +40,7 @@ python -m PyInstaller `
     --windowed `
     --name EZ-OpenVPN-Toolkit-Web `
     --add-data "needed_binaries;needed_binaries" `
+    --add-data "screenshots;screenshots" `
     --add-data "exit_app.ps1;." `
     --add-data "deploy_ovpn_server_on_win10-11.ps1;." `
     --add-data "deploy_ovpn_server_linux.sh;." `
