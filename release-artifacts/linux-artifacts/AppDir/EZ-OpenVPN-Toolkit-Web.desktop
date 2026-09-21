@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=EZ-OpenVPN-Toolkit-Web
+Exec=EZ-OpenVPN-Toolkit-Web
+Icon=EZ-OpenVPN-Toolkit-Web
+Categories=Network;
+Terminal=false
