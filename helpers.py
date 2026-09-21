@@ -67,6 +67,22 @@ class Spinner:
         print(f"{self.message} ... {suffix}")
 
 
+def _command_environment(command: Sequence[str]) -> dict:
+    env = os.environ.copy()
+    executable = os.path.basename(str(command[0])).lower()
+
+    # PyInstaller sets LD_LIBRARY_PATH to bundled libraries. Restore the
+    # original system path when launching the system OpenSSL executable.
+    if sys.platform.startswith("linux") and executable == "openssl":
+        original = env.pop("LD_LIBRARY_PATH_ORIG", None)
+        if original is not None:
+            env["LD_LIBRARY_PATH"] = original
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+
+    return env
+
+
 def run_command_with_progress(cmd: Sequence[str], message: str) -> None:
     """
     Run a command while showing a spinner. Streams combined stdout+stderr so
@@ -81,6 +97,7 @@ def run_command_with_progress(cmd: Sequence[str], message: str) -> None:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            env=_command_environment(cmd),
             **_hidden_subprocess_kwargs(),
         )
         last_line_time = time.time()
@@ -115,6 +132,7 @@ def run_command(command: Sequence[str]) -> None:
             check=True,
             capture_output=True,
             text=True,
+            env=_command_environment(command),
             **_hidden_subprocess_kwargs(),
         )
         if result.stdout:
