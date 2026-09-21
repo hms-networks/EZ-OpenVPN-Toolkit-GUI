@@ -1,0 +1,63 @@
+name: Build release artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build Windows executable
+        shell: pwsh
+        run: .\build_web_gui_exe.ps1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: |
+            dist/*.exe
+            *.exe
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse
+          pip install -r requirements.txt pyinstaller
+
+      - name: Normalize scripts
+        run: sed -i 's/\r$//' build_web_gui*.sh
+
+      - name: Build Linux executable
+        run: bash build_web_gui_linux.sh
+
+      - name: Build AppImage
+        run: bash build_web_gui_appimage.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-artifacts
+          path: |
+            dist/**
+            AppDir/**
+            *.AppImage
