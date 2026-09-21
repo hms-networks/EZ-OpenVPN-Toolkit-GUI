@@ -14,14 +14,18 @@ if [[ ! -x "$DIST_BIN" ]]; then
   "$SCRIPT_DIR/build_web_gui_linux.sh"
 fi
 
-if ! command -v appimagetool >/dev/null 2>&1; then
-  cat <<'EOF'
-appimagetool is required to create an AppImage.
-Install one of these ways, then re-run this script:
-  1) Debian/Ubuntu: sudo apt-get install appimagetool
-  2) Fedora: sudo dnf install appimagetool
-  3) Download from: https://github.com/AppImage/AppImageKit/releases
-EOF
+APPIMAGE_TOOL="${APPIMAGE_TOOL:-}"
+
+if [[ -z "$APPIMAGE_TOOL" ]] && command -v appimagetool >/dev/null 2>&1; then
+  APPIMAGE_TOOL="$(command -v appimagetool)"
+fi
+
+if [[ -z "$APPIMAGE_TOOL" && -x "$SCRIPT_DIR/.tools/appimagetool.AppImage" ]]; then
+  APPIMAGE_TOOL="$SCRIPT_DIR/.tools/appimagetool.AppImage"
+fi
+
+if [[ -z "$APPIMAGE_TOOL" ]]; then
+  echo "appimagetool is required to create an AppImage." >&2
   exit 1
 fi
 
@@ -51,7 +55,7 @@ EOF
 
 ARCH="${ARCH:-x86_64}"
 OUTPUT_PATH="$SCRIPT_DIR/dist/${APP_NAME}-${ARCH}.AppImage"
-appimagetool "$APPDIR" "$OUTPUT_PATH"
+APPIMAGE_EXTRACT_AND_RUN=1 "$APPIMAGE_TOOL" "$APPDIR" "$OUTPUT_PATH"
 
 chmod +x "$OUTPUT_PATH"
 echo "Built $OUTPUT_PATH"
