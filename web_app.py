@@ -1772,6 +1772,8 @@ class ToolkitHandler(BaseHTTPRequestHandler):
             return self._send_json(job)
         if parsed.path == "/api/download":
             query = parse_qs(parsed.query)
+            if query.get("csrf_token", [""])[0] != _CSRF_TOKEN:
+                return self._send_json({"error": "Forbidden."}, HTTPStatus.FORBIDDEN)
             rel_path = query.get("path", [""])[0]
             try:
                 file_path = _safe_join(rel_path)
@@ -4437,7 +4439,7 @@ INDEX_HTML = r"""<!doctype html>
           btn.textContent = `Download ${spec.filename}`;
           btn.disabled = false;
           btn.onclick = () => {
-            window.location.href = `/api/download?path=${encodeURIComponent(pkg.path)}`;
+            window.location.href = `/api/download?path=${encodeURIComponent(pkg.path)}&csrf_token=${encodeURIComponent(CSRF_TOKEN)}`;
           };
         } else {
           btn.textContent = spec.generateLabel;
@@ -4466,7 +4468,7 @@ INDEX_HTML = r"""<!doctype html>
         const safePrefix = `clients/${name}/`;
         const files = allDownloads.filter(file => (file.path || "").replace(/\\/g, "/").startsWith(safePrefix));
         const pkgHtml = files.length
-          ? files.map(file => `<a class="download" href="/api/download?path=${encodeURIComponent(file.path)}">${file.name.split("/").pop()}</a>`).join(" ")
+          ? files.map(file => `<a class="download" href="/api/download?path=${encodeURIComponent(file.path)}&csrf_token=${encodeURIComponent(CSRF_TOKEN)}">${file.name.split("/").pop()}</a>`).join(" ")
           : `<span class="muted">No package yet</span>`;
         const safeName = String(name).replace(/'/g, "\\'");
         const deployBtn = `<button type="button" onclick="packageClientEwonByName('${safeName}')">Deploy as Cosy+/Flexy</button>`;
