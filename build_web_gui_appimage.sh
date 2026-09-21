@@ -31,6 +31,10 @@ fi
 
 rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications"
+if command -v convert >/dev/null 2>&1 && [[ -f "$SCRIPT_DIR/HMS.ico" ]]; then
+  convert "$SCRIPT_DIR/HMS.ico[0]" -resize 256x256 \
+    "$APPDIR/EZ-OpenVPN-Toolkit-Web.png"
+fi
 
 cp "$DIST_BIN" "$APPDIR/usr/bin/$BIN_NAME"
 chmod +x "$APPDIR/usr/bin/$BIN_NAME"
@@ -48,7 +52,7 @@ cat > "$APPDIR/$APP_NAME.desktop" <<EOF
 Type=Application
 Name=$APP_NAME
 Exec=$BIN_NAME
-Icon=utilities-terminal
+Icon=EZ-OpenVPN-Toolkit-Web
 Categories=Network;
 Terminal=false
 EOF
