@@ -1681,6 +1681,58 @@ class ToolkitHandler(BaseHTTPRequestHandler):
     def _is_client_disconnect_error(exc: BaseException) -> bool:
         return isinstance(exc, (BrokenPipeError, ConnectionResetError))
 
+    def _is_valid_local_host(self) -> bool:
+        """Only accept requests addressed to this local server."""
+        host = self.headers.get("Host", "")
+        expected_port = self.server.server_port
+
+        try:
+            parsed = urlparse(f"//{host}")
+            hostname = (parsed.hostname or "").lower()
+            port = parsed.port
+        except ValueError:
+            return False
+
+        return (
+            hostname in {"127.0.0.1", "localhost"}
+            and port == expected_port
+        )
+
+    def _is_valid_origin(self) -> bool:
+        """Reject cross-origin browser requests."""
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+
+        try:
+            parsed = urlparse(origin)
+            return (
+                parsed.scheme == "http"
+                and (parsed.hostname or "").lower()
+                in {"127.0.0.1", "localhost"}
+                and parsed.port == self.server.server_port
+            )
+        except ValueError:
+            return False
+
+    def parse_request(self):
+        if not super().parse_request():
+            return False
+
+        if not self._is_valid_local_host():
+            self.send_error(HTTPStatus.FORBIDDEN, "Invalid Host header")
+            return False
+
+        if self.headers.get("Sec-Fetch-Site", "").lower() == "cross-site":
+            self.send_error(HTTPStatus.FORBIDDEN, "Cross-site request rejected")
+            return False
+
+        if not self._is_valid_origin():
+            self.send_error(HTTPStatus.FORBIDDEN, "Invalid Origin header")
+            return False
+
+        return True
+
     def do_GET(self):
         _touch_activity()
         parsed = urlparse(self.path)
@@ -2698,7 +2750,7 @@ INDEX_HTML = r"""<!doctype html>
       },
       mgmt_clients: {
         title: "Clients (status 3)",
-        html: `<p>Displays connected client sessions from the OpenVPN management interface and traffic totals.</p><p>You can refresh the view and disconnect specific active sessions from this table.</p>`,
+        html: `<p>Displays connected client sessions from the OpenVPN management interface and traffic totals.</p><p>Use the action buttons to disconnect specific active sessions from this table.</p>`,
       },
       mgmt_command: {
         title: "Management Command",
