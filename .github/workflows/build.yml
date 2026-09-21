@@ -43,14 +43,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y fuse imagemagick openssl openvpn
-          pip install -r requirements.txt pyinstaller
-
-      - name: Normalize scripts
-        run: sed -i 's/\r$//' build_web_gui*.sh
+          python -m pip install -r requirements.txt pyinstaller
 
       - name: Smoke-test system crypto tools
         run: |
           set -e
+          command -v openssl
+          command -v openvpn
           env LD_LIBRARY_PATH= /usr/bin/openssl version
           rm -f /tmp/ta-test.key
           env LD_LIBRARY_PATH= /usr/bin/openvpn --genkey secret /tmp/ta-test.key
