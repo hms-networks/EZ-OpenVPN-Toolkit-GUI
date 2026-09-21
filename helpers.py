@@ -73,7 +73,7 @@ def _command_environment(command: Sequence[str]) -> dict:
 
     # PyInstaller sets LD_LIBRARY_PATH to bundled libraries. Restore the
     # original system path when launching the system OpenSSL executable.
-    if sys.platform.startswith("linux") and executable == "openssl":
+    if sys.platform.startswith("linux") and executable in {"openssl", "openvpn"}:
         original = env.pop("LD_LIBRARY_PATH_ORIG", None)
         if original is not None:
             env["LD_LIBRARY_PATH"] = original
