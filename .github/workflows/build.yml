@@ -48,11 +48,11 @@ jobs:
       - name: Smoke-test system crypto tools
         run: |
           set -e
-          command -v openssl
-          command -v openvpn
-          env LD_LIBRARY_PATH= /usr/bin/openssl version
+          OPENSSL="$(command -v openssl)"
+          OPENVPN="$(command -v openvpn)"
+          "$OPENSSL" version
           rm -f /tmp/ta-test.key
-          env LD_LIBRARY_PATH= /usr/bin/openvpn --genkey secret /tmp/ta-test.key
+          env LD_LIBRARY_PATH= "$OPENVPN" --genkey secret /tmp/ta-test.key
           test -s /tmp/ta-test.key
           rm -f /tmp/ta-test.key
 
