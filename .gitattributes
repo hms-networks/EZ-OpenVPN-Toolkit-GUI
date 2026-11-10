@@ -1,0 +1,4 @@
+# Shell scripts must keep LF endings or they fail on Linux ("bad interpreter: /bin/bash^M")
+*.sh text eol=lf
+AppDir/AppRun text eol=lf
+AppDir/*.desktop text eol=lf

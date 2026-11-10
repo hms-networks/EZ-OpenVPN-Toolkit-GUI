@@ -11,6 +11,7 @@ import json
 import logging
 import shutil
 import sys
+import time
 import zipfile
 
 from client_revoke import revoke_client
@@ -548,7 +549,10 @@ def package_server_linux():
         temp_dir = os.path.join(BASE_DIR, "temp_linux_deploy")
         os.makedirs(temp_dir, exist_ok=True)
         shutil.copytree(server_dir, os.path.join(temp_dir, "server"))
-        shutil.copy(bash_script, temp_dir)
+        script_name = os.path.basename(bash_script)
+        with open(bash_script, "rb") as f:
+            # Force LF endings: a CRLF script fails on Linux with "/bin/bash^M: bad interpreter".
+            script_bytes = f.read().replace(b"\r\n", b"\n")
 
         zip_filename = os.path.join(BASE_DIR, "OpenVPN_Server_Linux.zip")
         with zipfile.ZipFile(zip_filename, "w", zipfile.ZIP_DEFLATED) as zipf:
@@ -557,6 +561,12 @@ def package_server_linux():
                     file_path = os.path.join(root, file)
                     arcname = os.path.relpath(file_path, start=temp_dir)
                     zipf.write(file_path, arcname)
+            # Mark the script as a Unix 0755 file so it extracts executable even when packaged on Windows.
+            script_info = zipfile.ZipInfo(script_name, date_time=time.localtime()[:6])
+            script_info.compress_type = zipfile.ZIP_DEFLATED
+            script_info.create_system = 3
+            script_info.external_attr = (0o100755 << 16)
+            zipf.writestr(script_info, script_bytes)
         print(f"Packaged server files into '{zip_filename}'.")
         logging.info(f"Packaged server for Linux deployment: {zip_filename}")
 
