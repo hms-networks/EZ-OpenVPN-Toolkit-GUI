@@ -91,10 +91,18 @@ jobs:
           cp artifacts/windows-exe/dist/EZ-OpenVPN-Toolkit-Web.exe .
           cp artifacts/linux-artifacts/dist/EZ-OpenVPN-Toolkit-Web .
           cp artifacts/linux-artifacts/dist/EZ-OpenVPN-Toolkit-Web-x86_64.AppImage .
+          # Use the annotated tag message as release notes (fall back to auto-generated notes).
+          TAG_SHA=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" -q '.object.sha')
+          TAG_TYPE=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" -q '.object.type')
+          NOTES_ARGS=(--generate-notes)
+          if [ "$TAG_TYPE" = "tag" ]; then
+            gh api "repos/$GITHUB_REPOSITORY/git/tags/$TAG_SHA" -q '.message' > notes.md
+            NOTES_ARGS=(--notes-file notes.md)
+          fi
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$TAG" \
-            --notes-from-tag \
+            "${NOTES_ARGS[@]}" \
             --verify-tag \
             EZ-OpenVPN-Toolkit-Web.exe \
             EZ-OpenVPN-Toolkit-Web \
