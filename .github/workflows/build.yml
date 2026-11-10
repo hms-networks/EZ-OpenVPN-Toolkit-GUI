@@ -69,3 +69,33 @@ jobs:
             dist/**
             AppDir/**
             *.AppImage
+
+  release:
+    # Publish a GitHub Release only for version tags, not manual test runs.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -e
+          cp artifacts/windows-exe/dist/EZ-OpenVPN-Toolkit-Web.exe .
+          cp artifacts/linux-artifacts/dist/EZ-OpenVPN-Toolkit-Web .
+          cp artifacts/linux-artifacts/dist/EZ-OpenVPN-Toolkit-Web-x86_64.AppImage .
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --notes-from-tag \
+            --verify-tag \
+            EZ-OpenVPN-Toolkit-Web.exe \
+            EZ-OpenVPN-Toolkit-Web \
+            EZ-OpenVPN-Toolkit-Web-x86_64.AppImage
